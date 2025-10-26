@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+
+main() {
+    ensure_root
+    parse_args "$@"
+    get_mail_server_infos
+    need_vps_configured
+    if [[ $ADD_DOMAIN == true ]]; then
+	:
+    else
+	install_deps
+    	set_firewall
+    fi
+    generate_certificates
+    if [[ $ADD_DOMAIN == true ]]; then
+	update_postfix
+	update_dovecot
+	update_opendkim
+    else
+	configure_postfix
+	configure_dovecot
+	configure_opendkim
+	synergize_postfix_and_opendkim
+    fi
+    prevent_opendkim_pid_error
+    if [[ $ADD_DOMAIN == true ]]; then
+	:
+    else
+	configure_fail2ban
+	enable_spamd
+    fi
+    restart_services
+    if [[ $ADD_DOMAIN == true ]]; then
+	update_certbot_hook
+    else
+	set_certbot_hook
+	add_postmaster_user
+    fi
+    configure_mta_sts
+    configure_dane
+    create_registrar_entries
+    save_registrar_entries
+    print_registrar_entries
+}
+
+info() { echo "[INFO] $*"; }
+warn() { echo "[WARNING] $*"; }
+error() { echo "[ERROR] $*"; exit 1; }
+abort() { echo "Aborting."; exit 0; }
+
+parse_args() {
+    local args=($@)
+    for arg in "${args[@]}"; do
+	case $arg in
+	    -a|--add-domain)
+		info "Adding a new domain."
+		ADD_DOMAIN=true
+		;;
+	esac
+    done
+}
+
+ensure_root() {
+    if [[ $EUID != 0 ]]; then
+        error "This script must be run with root privileges."
+    fi
+}
+
+check_domain() {
+    read -p "Full mail domain (e.g. mail.example.org): " domain
+    # remove https?:// from input
+    domain="${domain//https:\/\//}"
+    domain="${domain//http:\/\//}"
+    local a="[a-zA-Z0-9]" b="[-a-zA-Z0-9]" c="[a-zA-Z]"
+    local rough_regex="($a$b{1,61}$a)\.($a$b{1,61}$a)\.($c{2,}(\.$c{2,})?)"
+    if [[ $domain =~ $rough_regex ]]; then
+	subdom="${BASH_REMATCH[1]}"
+	domain="${BASH_REMATCH[2]}"
+	ltd="${BASH_REMATCH[3]}" # useless?
+    else
+	error "Incorrect domain."
+    fi
+}
+
+confirm_infos() {
+    maildomain=${subdom}.${domain}   	# mail.example
+    fulldomain=${domain}.${ltd}      	# example.ltd
+    fullmaildomain=${maildomain}.${ltd}	# mail.example.ltd
+    ## debug
+    #info "This is what you provided:
+    #- subdom      : $subdom
+    #- domain      : $domain
+    #- maildomain  : $maildomain
+    #- fulldomain  : $fulldomain
+    #- fullmaildom : $fullmaildomain
+    #- ltd         : $ltd
+    #"
+    info "Is this correct:
+    - domain name    : $fulldomain
+    - mail subdomain : $fullmaildomain
+    "
+    local answer
+    read -p "Confirm? [Y|n] " answer # default to Yes
+    [[ $answer =~ ([yY]|^$) ]] || get_mail_server_infos
+}
+
+get_mail_server_infos() {
+    check_domain
+    confirm_infos
+}
+
+grab_ips() {
+    ipv4=$(host "$fulldomain" | grep -m1 -Po '([0-9]+\.){3}[0-9]+')
+    ipv6=$(host "$fulldomain" | grep "IPv6" | awk '{print $NF}')
+    if [[ -z $ipv4 && -z $ipv6 ]]; then
+	error "No IP linked to $fulldomain"
+    fi
+}
+
+need_vps_configured() {
+    # Set up mail hoster with nginx before launching
+    # Ensure port 25 is open on VPS provider
+    info "Ensure your registrar's A and/or AAAA records point correctly to:
+        \"$fullmaildomain\"
+        \"mta-sts.$fulldomain\"
+    "
+    echo "This must be done before installing the mailserver."
+    read -p "Press enter to continue..."
+
+    grab_ips
+
+    # Ensure nginx
+    if ! command -v nginx >/dev/null 2>&1; then
+        info "nginx is not installed on this machine
+	motomail is NGINX COMPATIBLE-ONLY  at the moment"
+	info "nginx will be installed"
+	read -p "Press enter to continue..."
+	apt install nginx -y
+    fi
+    #ensure certbot
+    if ! command -v certbot >/dev/null 2>&1; then
+	info "motomail is CERTBOT COMPATIBLE-ONLY  at the moment"
+	info "certbot will be installed"
+	read -p "Press enter to continue..."
+	apt install python3-certbot python3-certbot-nginx certbot -y
+    fi
+}
+
+install_deps() {
+    deps=( postfix postfix-pcre dovecot-imapd dovecot-pop3d dovecot-sieve opendkim opendkim-tools spamassassin spamc net-tools fail2ban bind9-host )
+    info "The following packages will be (re)installed: ${deps[@]}"
+    read -p "Press enter to continue..."
+    apt purge '~c' ${deps[@]} -y || error "Some dependencies failed to be purged."
+    apt install ${deps[@]} -y || error "Some dependencies could not be installed."
+}
+
+set_firewall() {
+    local firewalls=( ufw ) # Must be executable name, not package
+    local ports=( 25 80 465 587 993 )
+    for fw in "${firewalls[@]}"; do
+	which "$fw" &>/dev/null || continue
+	local found_firewall=true
+	info "Opening some firewall ports"
+	case $fw in
+	    ufw)
+		for port in "${ports[@]}"; do
+		    ufw allow $port
+		done
+		;;
+	    *)
+		warn "$ufw is not yet configurable. Ignoring."
+		;;
+	esac
+	break
+    done
+    [[ -z $found_firewall ]] && info "No firewall was found."
+    info "Those ports need to be open: ${ports[@]}"
+    info "If your mail server is behind a proxy, or if your VPS provider blocks ports by default, open them up."
+    read -p "Press enter to continue..."
+}
+
+generate_certificates() {
+    info "Generating certificate for \"$fullmaildomain\""
+    certissuer_path=/etc/letsencrypt/live
+    certdir=$certissuer_path/$fullmaildomain
+    certbot -d "$fullmaildomain" --register-unsafely-without-email --agree-tos
+}
+
+configure_postfix() {
+    # setting "/etc/postfix/main.cf"
+    postconf -e "myhostname = $fullmaildomain"
+    postconf -e "mail_name = $fulldomain"
+    postconf -e "mydomain = $fulldomain"
+    postconf -e 'mydestination = $myhostname, $mydomain, mail, localhost.localdomain, localhost, localhost.$mydomain'
+
+    # comment it but could remove it
+    sed -r "s/^(smtpd_tls_cert_file *=.*)/#\1/" /etc/postfix/main.cf
+    sed -r "s/^(smtpd_tls_key_file *=.*)/#\1/" /etc/postfix/main.cf
+
+    # postconf accepts no multi-lines input
+    postconf -X "smtpd_tls_chain_files"
+cat >> /etc/postfix/main.cf << EOF
+smtpd_tls_chain_files =
+    /etc/letsencrypt/live/$fullmaildomain/privkey.pem
+    /etc/letsencrypt/live/$fullmaildomain/fullchain.pem
+EOF
+
+    postconf -e 'smtpd_tls_security_level = may'
+    postconf -e 'smtp_tls_security_level = dane'
+    echo "# Fallback in case Dane loose correct configured" >> /etc/postfix/main.cf
+    echo "smtpd_tls_security_level = may" >> /etc/postfix/main.cf
+
+    postconf -e 'smtpd_tls_auth_only = yes'
+    postconf -e 'smtpd_tls_mandatory_protocols = >=TLSv1.3'
+    postconf -e 'smtp_tls_mandatory_protocols = >=TLSv1.3'
+    postconf -e 'smtpd_tls_protocols = >=TLSv1.3'
+    postconf -e 'smtp_tls_protocols = >=TLSv1.3'
+
+    postconf -e 'smtpd_sasl_auth_enable = yes'
+    postconf -e 'smtpd_sasl_type = dovecot'
+    postconf -e 'smtpd_sasl_path = private/auth'
+    postconf -e "smtpd_sender_login_maps = pcre:/etc/postfix/login_maps.pcre"
+    postconf -e 'smtpd_sender_restrictions = reject_sender_login_mismatch, permit_sasl_authenticated, permit_mynetworks, reject_unknown_reverse_client_hostname, reject_unknown_sender_domain'
+    postconf -e 'smtpd_recipient_restrictions = permit_sasl_authenticated, permit_mynetworks, reject_unauth_destination, reject_unknown_recipient_domain'
+    postconf -e 'smtpd_relay_restrictions = permit_sasl_authenticated, reject_unauth_destination'
+    postconf -e 'smtpd_helo_required = yes'
+    postconf -e 'smtpd_helo_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_invalid_helo_hostname, reject_non_fqdn_helo_hostname, reject_unknown_helo_hostname'
+    postconf -e 'home_mailbox = mail/Inbox/'
+    postconf -e "header_checks = regexp:/etc/postfix/header_checks"
+
+    # Avoid headers-leak when client send mails
+cat > /etc/postfix/header_checks << EOF
+/^Received:.*/     IGNORE
+/^X-Originating-IP:/    IGNORE
+/^User-Agent:/	IGNORE
+/^X-Mailer:/	IGNORE
+EOF
+
+    # Ensure sender's name corresponds to their username on the server.
+    # Example: johndoe@example.org must correspond to user "johndoe"
+    echo "/^(.*)@${fulldomain//\./\\\.}\$/   \${1}" > /etc/postfix/login_maps.pcre
+
+    # Setting "/etc/postfix/master.cf"
+    sed -i '/^\s*-o/d;/^\s*submission/d;/^\s*smtp/d' /etc/postfix/master.cf
+
+cat >> /etc/postfix/master.cf << EOF
+smtp unix - - n - - smtp
+smtp inet n - y - - smtpd
+  -o content_filter=spamassassin
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_tls_auth_only=yes
+#  -o smtpd_enforce_tls=yes # will be removed soon
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_sender_restrictions=reject_sender_login_mismatch
+  -o smtpd_sender_login_maps=pcre:/etc/postfix/login_maps.pcre
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject_unauth_destination
+smtps     inet  n       -       y       -       -       smtpd
+  -o syslog_name=postfix/smtps
+  -o smtpd_tls_wrappermode=yes
+  -o smtpd_sasl_auth_enable=yes
+spamassassin unix -     n       n       -       -       pipe
+  user=debian-spamd argv=/usr/bin/spamc -f -e /usr/sbin/sendmail -oi -f \${sender} \${recipient}
+
+# For Dane support
+dane       unix  -       -       n       -       -       smtp
+  -o smtp_dns_support_level=dnssec
+  -o smtp_tls_security_level=dane
+EOF
+}
+
+update_postfix() {
+    # setting "/etc/postfix/main.cf"
+    # add to $mydestination
+    local mydestination=$(grep "^mydestination = " /etc/postfix/main.cf)
+    sed -i "s/$mydestination/${mydestination}, $fulldomain/" /etc/postfix/main.cf
+
+    # Ensure sender's name corresponds to their username on the server.
+    # Example: johndoe@example.org must correspond to user "johndoe"
+    echo "/^(.*)@${fulldomain//\./\\\.}\$/   \${1}" >> /etc/postfix/login_maps.pcre
+}
+
+configure_dovecot() {
+    mv /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.backup.conf
+cat > /etc/dovecot/dovecot.conf << EOF
+dovecot_config_version = 2.4.0
+dovecot_storage_version = 2.4.0
+
+ssl_server_cert_file = /etc/letsencrypt/live/${fullmaildomain}/fullchain.pem
+ssl_server_key_file = /etc/letsencrypt/live/${fullmaildomain}/privkey.pem
+
+local_name $fullmaildomain {
+    ssl_server_cert_file = /etc/letsencrypt/live/$fullmaildomain/fullchain.pem
+    ssl_server_key_file = /etc/letsencrypt/live/$fullmaildomain/privkey.pem
+}
+
+# <motomail>insert local_name ${subdom}.altdomain.com here</motomail>
+
+ssl = required
+ssl_min_protocol = TLSv1.3
+ssl_cipher_list = EECDH+ECDSA+AESGCM:EECDH+aRSA+AESGCM:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA256:EECDH+ECDSA+SHA384:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA384:EDH+aRSA+AESGCM:EDH+aRSA+SHA256:EDH+aRSA:EECDH:!aNULL:!eNULL:!MEDIUM:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS:!RC4:!SEED
+ssl_server_prefer_ciphers = server
+ssl_server_dh_file = /usr/share/dovecot/dh.pem
+auth_mechanisms = plain login
+auth_username_format = %{user | username}
+
+protocols = imap pop3
+
+userdb users {
+    driver = passwd
+}
+
+passdb pam {
+    driver = pam
+}
+
+mail_driver = maildir
+mail_path = ~/mail
+mail_inbox_path = ~/mail/Inbox
+mailbox_list_layout = fs
+
+namespace inbox {
+	inbox = yes
+	mailbox Drafts {
+	special_use = \\Drafts
+	auto = subscribe
+    }
+	mailbox Junk {
+	special_use = \\Junk
+	auto = subscribe
+	autoexpunge = 30d
+    }
+	mailbox Sent {
+	special_use = \\Sent
+	auto = subscribe
+    }
+	mailbox Trash {
+	special_use = \\Trash
+    }
+	mailbox Archive {
+	special_use = \\Archive
+    }
+}
+
+# Allow postfix to use dovecot's authentication system
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+	mode = 0660
+	user = postfix
+	group = postfix
+    }
+}
+
+protocol lda {
+  mail_plugins = sieve
+}
+
+protocol lmtp {
+  mail_plugins = sieve
+}
+
+protocol pop3 {
+  pop3_uidl_format = %{uid | hex(8)}%{uidvalidity | hex(8)}
+  pop3_no_flag_updates = yes
+}
+
+sieve_script personal {
+    driver = file
+        type = personal
+        path = ~/.sieve
+        active_path = ~/.dovecot.sieve
+}
+sieve_script default {
+    type = default
+        name = default
+        driver = file
+        path = /var/lib/dovecot/sieve/default.sieve
+}
+sieve_script global {
+    type = global
+        path = /var/lib/dovecot/sieve/
+}
+EOF
+
+    # Add sieve plugin
+    mkdir /var/lib/dovecot/sieve/
+
+cat > /var/lib/dovecot/sieve/default.sieve << EOF
+require ["fileinto", "mailbox"];
+if header :contains "X-Spam-Flag" "YES"
+{
+    fileinto "Junk";
+}
+EOF
+
+    # Add "vmail" user
+    grep -q '^vmail:' /etc/passwd || useradd vmail
+    chown -R vmail:vmail /var/lib/dovecot
+    sievec /var/lib/dovecot/sieve/default.sieve
+
+    # dovecot userauth
+    grep -q nullok /etc/pam.d/dovecot || echo -e "auth\trequired\tpam_unix.so nullok\naccount\trequired\tpam_unix.so" >> /etc/pam.d/dovecot
+}
+
+update_dovecot() {
+    #mv /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.backup.conf
+cat >> /etc/dovecot/dovecot.conf << EOF
+# [motomail] add domain $fullmaildomain
+
+ssl_server_cert_file = /etc/letsencrypt/live/${fullmaildomain}/fullchain.pem
+ssl_server_key_file = /etc/letsencrypt/live/${fullmaildomain}/privkey.pem
+
+local_name $fullmaildomain {
+    ssl_server_cert_file = /etc/letsencrypt/live/$fullmaildomain/fullchain.pem
+    ssl_server_key_file = /etc/letsencrypt/live/$fullmaildomain/privkey.pem
+}
+
+EOF
+}
+
+configure_opendkim() {
+# useful to try sending to legit mail providers
+    mkdir -p "/etc/postfix/dkim/$fulldomain"
+    opendkim-genkey -D "/etc/postfix/dkim/$fulldomain" -d "$fulldomain" -s "$subdom"
+    chgrp -R opendkim /etc/postfix/dkim/*
+    chmod -R g+r /etc/postfix/dkim/*
+    grep -q "$fulldomain" /etc/postfix/dkim/keytable 2>/dev/null || \
+	echo "$subdom._domainkey.$fulldomain $fulldomain:$subdom:/etc/postfix/dkim/$fulldomain/$subdom.private" >> /etc/postfix/dkim/keytable
+    grep -q "$fulldomain" /etc/postfix/dkim/signingtable 2>/dev/null || \
+	echo "*@$fulldomain $subdom._domainkey.$fulldomain" >> /etc/postfix/dkim/signingtable
+    grep -q '127.0.0.1' /etc/postfix/dkim/trustedhosts 2>/dev/null || \
+    cat >> /etc/postfix/dkim/trustedhosts << EOF
+127.0.0.1
+10.1.0.0/16
+EOF
+    grep -q '^KeyTable' /etc/opendkim.conf 2>/dev/null || \
+cat >> /etc/opendkim.conf << EOF
+KeyTable file:/etc/postfix/dkim/keytable
+SigningTable refile:/etc/postfix/dkim/signingtable
+InternalHosts refile:/etc/postfix/dkim/trustedhosts
+EOF
+    sed -i '/^#Canonicalization/s/simple/relaxed\/simple/' /etc/opendkim.conf
+    sed -i '/^#Canonicalization/s/^#//' /etc/opendkim.conf
+    sed -i '/Socket/s/^#*/#/' /etc/opendkim.conf
+    grep -q '^Socket\s*inet:12301@localhost' /etc/opendkim.conf || echo 'Socket inet:12301@localhost' >> /etc/opendkim.conf
+    sed -i '/^SOCKET/d' /etc/default/opendkim && echo "SOCKET=\"inet:12301@localhost\"" >> /etc/default/opendkim
+}
+
+update_opendkim() {
+# useful to try sending to legit mail providers
+    mkdir -p "/etc/postfix/dkim/$fulldomain"
+    opendkim-genkey -D "/etc/postfix/dkim/$fulldomain" -d "$fulldomain" -s "$subdom"
+    chgrp -R opendkim /etc/postfix/dkim/*
+    chmod -R g+r /etc/postfix/dkim/*
+    grep -q "$fulldomain" /etc/postfix/dkim/keytable 2>/dev/null || \
+	echo "$subdom._domainkey.$fulldomain $fulldomain:$subdom:/etc/postfix/dkim/$fulldomain/$subdom.private" >> /etc/postfix/dkim/keytable
+    grep -q "$fulldomain" /etc/postfix/dkim/signingtable 2>/dev/null || \
+	echo "*@$fulldomain $subdom._domainkey.$fulldomain" >> /etc/postfix/dkim/signingtable
+}
+
+synergize_postfix_and_opendkim() {
+    postconf -e 'smtpd_sasl_security_options = noanonymous, noplaintext'
+    postconf -e 'smtpd_sasl_tls_security_options = noanonymous'
+    #postconf -e "myhostname = $maildomain"
+    postconf -e 'milter_default_action = accept'
+    postconf -e 'milter_protocol = 6'
+    postconf -e 'smtpd_milters = inet:localhost:12301'
+    postconf -e 'non_smtpd_milters = inet:localhost:12301'
+    postconf -e 'mailbox_command = /usr/lib/dovecot/deliver'
+    postconf -e 'smtpd_forbid_bare_newline = normalize'
+    postconf -e 'smtpd_forbid_bare_newline_exclusions = $mynetworks'
+}
+
+prevent_opendkim_pid_error() {
+    # A fix for "Opendkim won't start: can't open PID file?", as specified here: https://serverfault.com/a/847442
+    /lib/opendkim/opendkim.service.generate
+    systemctl daemon-reload
+}
+
+configure_fail2ban() {
+    [ ! -f /etc/fail2ban/jail.d/motomail.local ] && \
+cat > /etc/fail2ban/jail.d/motomail.local << EOF
+[postfix]
+enabled = true
+[postfix-sasl]
+enabled = true
+[sieve]
+enabled = true
+[dovecot]
+enabled = true
+EOF
+    sed -i "s|^backend = auto$|backend = systemd|" /etc/fail2ban/jail.conf
+}
+
+enable_spamd() {
+    sed -i "s|^CRON=0|CRON=1|" /etc/default/spamd
+    service spamd restart
+    systemctl enable spamd
+}
+
+restart_services() {
+    for s in opendkim dovecot postfix fail2ban; do
+        service "$s" restart
+        systemctl enable "$s"
+    done
+}
+
+set_certbot_hook() {
+    # We can "specify hooks by placing files in subdirectories of Certbot’s configuration directory".
+    # Any executable placed in "/etc/letsencrypt/renewal-hooks/deploy" will be executed after deploy.
+    # Executables are run in alphabetical order.
+    # Check official doc: https://eff-certbot.readthedocs.io/en/stable/using.html
+
+cat > /etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh << EOF
+#!/usr/bin/env bash
+# Restart services if a mail certificate was (re)deployed less than 30 minutes ago.
+for m in $fullmaildomain ; do # append domains here
+    if (( \$(find -L "${certissuer_path}/\${m}" -type f -mmin -30 | wc -l) )); then
+	for s in opendkim dovecot postfix fail2ban; do
+	    service "\$s" restart
+	done
+	break;
+    fi
+done
+exit 0
+EOF
+
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh
+}
+
+update_certbot_hook() {
+    local certbot_deploy_script=/etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh
+    sed -i "s/; do # append domains here/$fulldomain ; do # append domains here/" $certbot_deploy_script
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh
+}
+
+add_postmaster_user() {
+    # Add user postmaster with group mail
+    useradd -m -G mail postmaster
+}
+
+configure_mta_sts() {
+    # Add .well-known/mta-sts.txt to domain
+    # TODO nginx only atm!
+    local listen_ipv4=${ipv4:+"listen 443 ssl;"}
+    local listen_ipv6=${ipv6:+"listen [::]:443 ssl;"}
+cat > /etc/nginx/sites-available/mta-sts.${fulldomain}.conf << EOF
+server {
+    server_name mta-sts.$fulldomain;
+    $listen_ipv6
+    $listen_ipv4
+    location = /.well-known/mta-sts.txt {
+        default_type text/plain;
+        return 200 "version: STSv1\nmode: enforce\nmax_age: 604800\nmx: $fullmaildomain";
+    }
+}
+EOF
+    ln -s /etc/nginx/sites-available/mta-sts.${fulldomain}.conf /etc/nginx/sites-enabled/mta-sts.${fulldomain}.conf
+
+    id_mta_sts=$(date '+%s')
+    info "Add those TXT records to your registrar:
+    mta_sts=\"_mta-sts.$fulldomain	TXT	v=STSv1; id=$id_mta_sts\"
+    smtp_tls=\"_smtp._tls.$fulldomain	TXT	v=TLSRPTv1\"
+    "
+    read -p "Press enter to continue..."
+    certbot -d mta-sts.${fulldomain}
+}
+
+configure_dane() {
+    # We need two certificates: the maildomain's and the root from the issuer (letsencrypt for example)
+    # https://www.internetsociety.org/blog/2016/01/lets-encrypt-certificates-for-mail-servers-and-dane-part-1-of-2/
+    # "cert.pem" is our "end-entity certificate"
+
+    # dane_hash_current=$(openssl x509 -in /etc/letsencrypt/live/$maildomain/cert.pem -noout -pubkey | \
+    #			 openssl pkey -pubin -outform DER | \
+    #			 openssl dgst -sha256 -binary     | \
+    #			 hexdump -ve '/1 "%02x"')
+    # Simpler with postfix:
+    dane_hash_current=$(postfix tls output-server-tlsa /etc/letsencrypt/live/$fullmaildomain/privkey.pem | tail -n1 | grep -Po '[0-9a-z]+$')
+
+    dane_hash_rollover=$(openssl x509 -in /etc/letsencrypt/live/$fullmaildomain/chain.pem -noout -pubkey | \
+			openssl pkey -pubin -outform DER | \
+			openssl dgst -sha256 -binary     | \
+			hexdump -ve '/1 "%02x"')
+
+    # On Debian certbot stores an intermediate certificate chain in "chain.pem".
+    # It is NOT the Letsencrypt ISRG root X1, but an intermediate certificate.
+    # The concatenation of "cert.pem"+"chain.pem" is stored in "fullchain.pem"
+    # See https://community.letsencrypt.org/t/difference-between-fullchain-pem-and-cert-pem/184189
+
+    #+------------------------------------------------------------------------------------------------
+    #|  TODO
+    #|  If does not work, download the appropriate intermediate certificate and add it manually.
+    #|  Careful, the below command will not always work. The URL depends on how $cn evaluates.
+    #| cn=$(openssl s_client -showcerts -connect $maildom:465 </dev/null 2>/dev/null | grep 'CN=.*' | tail -n1 | sed 's/CN=//')
+    #| wget https://letsencrypt.org/certs/letsencryptauthority${cn}.pem
+
+    #|  This is for ISRG root X1 (not used if i understand correctly):
+    #|  curl -O https://letsencrypt.org/certs/isrgrootx1.pem
+    #|  cat cert.pem isrgrootx1.pem > motomail-fullchain.pem
+
+    #|  See:
+    #|  https://letsencrypt.org/certificates/
+    #|  https://community.letsencrypt.org/t/difference-between-fullchain-pem-and-cert-pem/184189
+    #|  https://github.com/certbot/certbot/issues/10189
+    #|  https://community.letsencrypt.org/t/with-preferred-chain-isrg-root-x1-fullchain-pem-doesnt-contain-the-isrg-root-x1-certificate/163224
+    #+------------------------------------------------------------------------------------------------
+}
+
+create_registrar_entries() {
+    pval="$(tr -d '\n' <"/etc/postfix/dkim/$fulldomain/$subdom.txt" | sed "s/k=rsa.* \"p=/k=rsa; p=/;s/\"\s*\"//;s/\"\s*).*//" | grep -o 'p=.*')"
+    dkimentry="$subdom._domainkey.$fulldomain	TXT	v=DKIM1; h=sha256; k=rsa; $pval"
+    dmarcentry="_dmarc.$fulldomain	TXT	v=DMARC1; p=reject; rua=mailto:postmaster@$fulldomain; fo=1"
+    spf_ipv4=${ipv4:+"ip4:$ipv4"}
+    spf_ipv6=${ipv6:+"ip6:$ipv6"}
+    spfentry="$fulldomain	TXT	v=spf1 mx a:$fullmaildomain $spf_ipv4 $spf_ipv6 -all"
+    mxentry="$fulldomain	MX	10	$fullmaildomain	300"
+    # mta-sts
+    mta_sts="_mta-sts.$fulldomain	TXT	v=STSv1; id=$id_mta_sts"
+    smtp_tls="_smtp._tls.$fulldomain	TXT	v=TLSRPTv1"
+    # dane
+    dane_current="_25._tcp.$fullmaildomain	TLSA	3 1 1 $dane_hash_current"
+    dane_rollover="_25._tcp.$fullmaildomain	TLSA	2 1 1 $dane_hash_rollover"
+}
+
+save_registrar_entries() {
+    cat > "$HOME/motomail_${fullmaildomain}.txt" << EOF
+$dkimentry
+$dmarcentry
+$spfentry
+$mxentry
+$mta_sts
+$smtp_tls
+# Some registrar's don't have TLSA records section.
+# If that is the case for you, try adding the below
+# entries in TXT records instead.
+$dane_current
+$dane_rollover
+EOF
+}
+
+print_registrar_entries() {
+    # Inform user
+    echo "Add/check those entries to your registrar:"
+    echo -e "$dkimentry\n"
+    echo -e "$dmarcentry\n"
+    echo -e "$spfentry\n"
+    echo -e "$mxentry\n"
+    echo -e "$dane_current\n"
+    echo -e "$dane_rollover\n"
+    #echo -e "$mta_sts\n" # already done
+    #echo -e "$smtp_tls\n" # already done
+}
+
+about_tlsa_renewal() {
+    # TODO speech about TLSA renewal
+    info "TLSA updating is not an easy-to-automatize task.\n \
+	One solution is to add '--reuse-key' to certbot so it will not generate new SSL private keys. \n
+	This is mostly safe if you never give your private key to anyone."
+    :
+}
+
+main "$@"
+
+#dougy147
+#created: 22.09.2025
+#updated: 26.10.2025
