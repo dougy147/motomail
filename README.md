@@ -1,4 +1,4 @@
-Deploy a secure self-hosted mailserver at the speed of light.
+Deploy a secure self-hosted mailserver at the speed of a motorcycle.
 
 Run `motomail` on a fresh Debian 13:
 
@@ -25,7 +25,7 @@ By secure, we mean it follows modern internet standards as prescribed by [intern
 It improves and borrows to [`emailwiz`](https://github.com/LukeSmithxyz/emailwiz) script.
 
 ```txt
-        o
+   [v]  @
   =m++_/-|>
-   (o)t\_(o)mail
- ```
+   (o)t\_(o)
+```
