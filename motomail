@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+echo "
+   [v]  @
+  =m++_/-|>
+   (o)t\_(o)
+"
+
 main() {
     ensure_root
     parse_args "$@"
@@ -38,6 +44,7 @@ main() {
     fi
     configure_mta_sts
     configure_dane
+    about_tlsa_renewal
     create_registrar_entries
     save_registrar_entries
     print_registrar_entries
@@ -654,11 +661,27 @@ print_registrar_entries() {
 }
 
 about_tlsa_renewal() {
+    certbot_check_reuse_key && return
     # TODO speech about TLSA renewal
-    info "TLSA updating is not an easy-to-automatize task.\n \
-	One solution is to add '--reuse-key' to certbot so it will not generate new SSL private keys. \n
-	This is mostly safe if you never give your private key to anyone."
-    :
+    info "TLSA updating is not an easy-to-automatize task.
+One solution is to add '--reuse-key' to certbot so it will not generate new SSL private keys.
+This is safe as long as your private key is never shared or stolen."
+    local answer
+    read -p "Do you want to apply this hack? (recommended for beginners) [y|N] " answer
+    [[ $answer =~ [yY] ]] && certbot_add_reuse_key
+}
+
+certbot_check_reuse_key() {
+    local service_path=$(systemctl show certbot.service | grep Path | cut -d= -f2)
+    if [[ $(grep "reuse-key" $service_path) ]]; then
+	return 0
+    fi
+    return 1
+}
+
+certbot_add_reuse_key() {
+    local service_path=$(systemctl show certbot.service | grep Path | cut -d= -f2)
+    sed -Ei "s_(^ExecStart=/usr/bin/certbot.*)_\1 --reuse-key_" $service_path
 }
 
 main "$@"
