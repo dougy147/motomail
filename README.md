@@ -18,6 +18,12 @@ $ ./motomail --add-domain
 - add `--reuse-key` to certbot (e.g. `systemctl edit --full certbot.service`) to avoid DANE's troubles when renewing certificates
 - mail users need an account on the system (i.e. no sql database)
 
+# Troubleshooting
+
+- after certificates update, server might offer wrong certificate on port 465 if hook script does not do:
+    - `postmap -F hash:/etc/postfix/vmail_ssl.map`
+    - double restart of services
+
 # About
 
 `motomail` is an interactive script to setup a secure self-hosted mailserver.

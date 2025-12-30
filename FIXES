@@ -1,0 +1,10 @@
+https://community.letsencrypt.org/t/postfix-issues-with-expired-certificate-on-port-465/233676
+
+Add a problem with wrong certificate
+Had to :
+
+sudo postmap -F hash:/etc/postfix/vmail_ssl.map
+
+it seems
+
+
