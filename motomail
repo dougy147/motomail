@@ -524,13 +524,19 @@ cat > /etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh << EOF
 # Restart services if a mail certificate was (re)deployed less than 30 minutes ago.
 for m in $fullmaildomain ; do # append domains here
     if (( \$(find -L "${certissuer_path}/\${m}" -type f -mmin -30 | wc -l) )); then
-	for s in opendkim dovecot postfix fail2ban; do
-	    service "\$s" restart
-	done
+    for double_restart_services in {1..2}; do # seems necessary in some cases (check sources)
+	    for s in opendkim dovecot postfix fail2ban; do
+	        service "\$s" restart
+            postmap -F hash:/etc/postfix/vmail_ssl.map # seems necessary in some cases
+	    done
+    done
 	break;
     fi
 done
 exit 0
+# 
+# https://community.letsencrypt.org/t/postfix-issues-with-expired-certificate-on-port-465/233676
+# https://community.letsencrypt.org/t/certbot-renew-and-postfix-issues-with-sni-map/236756
 EOF
 
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/motomail-restart-services.sh
@@ -688,4 +694,4 @@ main "$@"
 
 #dougy147
 #created: 22.09.2025
-#updated: 26.10.2025
+#updated: 07.11.2025
