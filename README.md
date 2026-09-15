@@ -1,8 +1,19 @@
-Deploy a secure self-hosted mailserver at the speed of a motorcycle.
 
-Run `motomail` on a fresh Debian 13:
+Deploy a secure self-hosted mailserver with a single script.
+
+```txt
+   [v]  @        _  _ o      _  _ a
+  =m++_/-|>     / \/ \ t    / \/ \ i
+   (o)t\_(o)   /_/\/\_\ o  /_/\/\_\ l 
+```
+
+# Quick deploy
+
+Run this on your Debian 13 VPS:
 
 ```console
+$ wget 'https://gitlab.com/dougy147/motomail/-/raw/master/motomail'
+$ chmod +x motomail
 $ ./motomail
 ```
 
@@ -12,26 +23,8 @@ To add domains on same server:
 $ ./motomail --add-domain
 ```
 
-# READ THIS
-
-- Debian 13 **required** (for other distros, prepare for tweaks)
-- add `--reuse-key` to certbot (e.g. `systemctl edit --full certbot.service`) to avoid DANE's troubles when renewing certificates
-- mail users need an account on the system (i.e. no sql database)
-
-# Troubleshooting
-
-- after certificates update, server might offer wrong certificate on port 465 if hook script does not do:
-    - `postmap -F hash:/etc/postfix/vmail_ssl.map`
-    - double restart of services
-
-# About
+# ABOUT
 
 `motomail` is an interactive script to setup a secure self-hosted mailserver.
 By secure, we mean it follows modern internet standards as prescribed by [internet.nl](https://internet.nl/).
 It improves and borrows to [`emailwiz`](https://github.com/LukeSmithxyz/emailwiz) script.
-
-```txt
-   [v]  @
-  =m++_/-|>
-   (o)t\_(o)
-```
